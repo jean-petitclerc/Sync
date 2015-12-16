@@ -49,7 +49,11 @@ def parse_configs():
     try:
         cfg_parser = configparser.ConfigParser()
         cfg_parser.read(CONFIG_FILE)
-        config['db_file'] = cfg_parser['database']['DB_FILE']
+        # config['db_file'] = cfg_parser['database']['DB_FILE']
+        config['accept_ext'] = cfg_parser['extensions']['ACCEPT_EXT']
+        config['accept_list'] = config['accept_ext'].lower().split(',')
+        config['reject_ext'] = cfg_parser['extensions']['REJECT_EXT']
+        config['reject_list'] = config['reject_ext'].lower().split(',')
     except Exception as x:
         logging.error("Could not read the configuration file: " + CONFIG_FILE)
         logging.error(x)
@@ -357,41 +361,46 @@ def get_metadata(root_dir, dir_name, file_name):
 
 def scan_dir(root_dir):
     logging.debug("Entrée dans scan_dir. Parm: " + root_dir)
-    counts = {'epub': 0, 'gif': 0, 'jpg': 0, 'mp3': 0, 'pdf': 0, 'txt': 0, 'others': 0}
+    # Initialize counters
+    accept_counts = {}
+    for ext in config['accept_list']:
+        accept_counts[ext] = 0
+    reject_counts = {}
+    for ext in config['reject_list']:
+        reject_counts[ext] = 0
+    others_counts = {}
+
+    # Scan the directory structure
     logging.info("Inspection de " + root_dir)
     for root, dirs, files in os.walk(root_dir):
         for file in files:
-            if file.endswith("epub") or file.endswith("EPUB"):
-                counts['epub'] += 1
+            filename, file_ext = os.path.splitext(file)
+            file_ext = file_ext.lower()
+            if file_ext in config['accept_list']:
+                accept_counts[file_ext] += 1
                 get_metadata(root_dir, root, file)
-            elif file.endswith(".gif") or file.endswith(".GIF"):
-                counts['gif'] += 1
-                get_metadata(root_dir, root, file)
-            elif (file.endswith(".jpg") or file.endswith(".jpeg") or
-                  file.endswith(".JPG") or file.endswith(".JPEG")):
-                counts['jpg'] += 1
-                get_metadata(root_dir, root, file)
-            elif file.endswith("mp3") or file.endswith("MP3"):
-                counts['mp3'] += 1
-                get_metadata(root_dir, root, file)
-            elif file.endswith("pdf") or file.endswith("PDF"):
-                counts['pdf'] += 1
-                get_metadata(root_dir, root, file)
-            elif file.endswith("txt") or file.endswith("TXT"):
-                counts['pdf'] += 1
-                get_metadata(root_dir, root, file)
+            elif file_ext in config['reject_list']:
+                reject_counts[file_ext] += 1
             else:
-                counts['others'] += 1
-                logging.info("Type de fichiers exclus: " + os.path.join(root, file))
+                if file_ext in others_counts:
+                    others_counts[file_ext] += 1
+                else:
+                    others_counts[file_ext] = 1
+                    logging.info("Fichiers de type inconnu: " + os.path.join(root, file))
+
+    # Summary Report
     logging.info(" ")
     logging.info("Statistiques pour " + root_dir)
-    logging.info("    Fichiers epub trouvés........................: %i" % counts['epub'])
-    logging.info("    Fichiers gif  trouvés........................: %i" % counts['gif'])
-    logging.info("    Fichiers jpg  trouvés........................: %i" % counts['jpg'])
-    logging.info("    Fichiers mp3  trouvés........................: %i" % counts['mp3'])
-    logging.info("    Fichiers pdf  trouvés........................: %i" % counts['pdf'])
-    logging.info("    Fichiers txt  trouvés........................: %i" % counts['txt'])
-    logging.info("    Autres fichiers trouvés......................: %i" % counts['others'])
+    logging.info("    Comptes par type de fichiers acceptés:")
+    for ext in config['accept_list']:
+        logging.info(("        " + ext).ljust(49, '.') + ": %i" % accept_counts[ext])
+    logging.info("    Comptes par type de fichiers rejetés:")
+    for ext in config['reject_list']:
+        logging.info(("        " + ext).ljust(49, '.') + ": %i" % reject_counts[ext])
+    if len(others_counts) > 0:
+        logging.info("    Comptes par type de fichiers inattendus:")
+        for ext in others_counts:
+            logging.info(("        " + ext).ljust(49, '.') + ": %i" % others_counts[ext])
     logging.info(" ")
     logging.debug("Sortie de scan_dir.")
 
@@ -429,16 +438,17 @@ def main():
     # Read config file
     config = parse_configs()
     logging.info("Configurations:")
-    if config['db_file'] is None:
-        logging.error("The DB_FILE is missing from the [database] section in " + CONFIG_FILE)
-        return 8
     logging.info("    Fichier de configuration.....................: " + CONFIG_FILE)
-    # logging.info("    Database file................................: " + config['db_file'])
+    for ext in config['accept_list']:
+        logging.info("    Accepted extension...........................: %s" % ext)
+    for ext in config['reject_list']:
+        logging.info("    Rejected extension...........................: %s" % ext)
 
     db_name = db_get_name(source_dir, target_dir)
     db_path = source_dir + os.sep + db_name
     logging.info("    Database file................................: " + db_name)
     logging.info(" ")
+
     conn = sqlite3.connect(db_path)
     db_create_tables()        # Create the DB objects
     db_remove_deleted()       # Remove deleted files from db
