@@ -74,14 +74,13 @@ def db_get_name(source_dir, target_dir):
     return db_name
 
 
-def db_create_tables():
+def db_create_tables(db_h):
     """
     Create the DB objects.
     Each ddl statement is appended in an array.
     Each ddl in the array is sent for execution to sqlite3
+    :param db_h: DB handle
     """
-
-    global conn
 
     ddl = [
         '''
@@ -118,15 +117,14 @@ create index if not exists ix_file_03
         ''']
 
     try:
-        c = conn.cursor()
+        c = db_h.cursor()
         for stmt in ddl:
             c.execute(stmt)
     except sqlite3.Error as x:
         logging.error("SQL Error: \n" + str(x))
 
 
-def db_store_file(file):
-    global conn
+def db_store_file(db_h, file):
     insert = \
         '''
         insert into file(dir_name, file_name, file_md5, file_mtime, file_size, root_dir, rel_path)
@@ -151,12 +149,12 @@ def db_store_file(file):
         '''
 
     try:
-        cur = conn.cursor()
+        cur = db_h.cursor()
         cur.execute(select, [file.dir_name, file.file_name])
         row = cur.fetchone()
         if row is None:
             logging.debug("The file is NOT in the database.")
-            ins = conn.cursor()
+            ins = db_h.cursor()
             ins.execute(insert, [file.dir_name, file.file_name, file.file_md5, file.file_mtime, file.file_size,
                                  file.root_dir, file.rel_path])
         else:
@@ -166,20 +164,20 @@ def db_store_file(file):
                 logging.debug("Same file")
             else:
                 logging.debug("Updating file md5, mtime and size.")
-                upd = conn.cursor()
+                upd = db_h.cursor()
                 upd.execute(update, [file.file_md5, file.file_mtime, file.file_size, file.dir_name, file.file_name])
     except sqlite3.Error as x:
         logging.error("SQL Error: \n" + str(x))
 
 
-def db_remove_deleted():
+def db_remove_deleted(db_h):
     """
     Verifies that every file in the file table really exists on the filesystem.
     If not the entry is deleted from the table.
+    :param db_h: DB handle
     :return: Nothing
     """
 
-    global conn
     logging.info("Nettoyage de la BD pour les fichiers effacés.")
     count_found = 0
     count_notfound = 0
@@ -199,7 +197,7 @@ def db_remove_deleted():
         '''
 
     try:
-        cur = conn.cursor()
+        cur = db_h.cursor()
         for row in cur.execute(select, []):
             dir_name = row[0]
             file_name = row[1]
@@ -210,7 +208,7 @@ def db_remove_deleted():
             else:
                 count_notfound += 1
                 logging.debug("Fichier non-existant.: " + file_path)
-                dlt = conn.cursor()
+                dlt = db_h.cursor()
                 dlt.execute(delete, [dir_name, file_name])
     except sqlite3.Error as x:
         logging.error("SQL Error: \n" + str(x))
@@ -220,8 +218,7 @@ def db_remove_deleted():
     logging.info(" ")
 
 
-def list_dup(root_dir):
-    global conn
+def list_dup(db_h, root_dir):
 
     sel_md5 = \
         '''
@@ -240,8 +237,8 @@ def list_dup(root_dir):
        '''
 
     try:
-        cur_md5 = conn.cursor()
-        cur_dup = conn.cursor()
+        cur_md5 = db_h.cursor()
+        cur_dup = db_h.cursor()
         for row_md5 in cur_md5.execute(sel_md5, [root_dir]):
             file_md5 = row_md5[0]
             logging.info("Possible duplicates: %s" % file_md5)
@@ -258,8 +255,7 @@ def list_dup(root_dir):
         logging.error("SQL Error: \n" + str(x))
 
 
-def find_missing_files(source_dir, target_dir):
-    global conn
+def find_missing_files(db_h, source_dir, target_dir):
     counts = {'copy': 0, 'compare': 0, 'kept': 0, 'newer': 0, 'older': 0}
 
     sel_src = \
@@ -279,8 +275,8 @@ def find_missing_files(source_dir, target_dir):
         '''
 
     try:
-        cur_src = conn.cursor()
-        cur_tgt = conn.cursor()
+        cur_src = db_h.cursor()
+        cur_tgt = db_h.cursor()
         for row_src in cur_src.execute(sel_src, [source_dir]):
             dir_name = row_src[0]
             file_name = row_src[1]
@@ -338,7 +334,7 @@ def copy_file(dir_name, file_name, target_dir, rel_path):
         logging.debug("Mode simulation: Fichier ne sera pas copié.")
 
 
-def get_metadata(root_dir, dir_name, file_name):
+def get_metadata(db_h, root_dir, dir_name, file_name):
     file_path = os.path.join(dir_name, file_name)
     (mode, ino, dev, nlink, uid, gid, file_size, atime, mtime, ctime) = os.stat(file_path)
     lastmod_date = time.localtime(mtime)
@@ -356,10 +352,10 @@ def get_metadata(root_dir, dir_name, file_name):
     logging.debug("    Grosseur en bytes............................: %i" % file_size)
     logging.debug("    Checksum.....................................: %s" % file_md5)
     file = File(file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path)
-    db_store_file(file)
+    db_store_file(db_h, file)
 
 
-def scan_dir(root_dir):
+def scan_dir(db_h, root_dir):
     logging.debug("Entrée dans scan_dir. Parm: " + root_dir)
     # Initialize counters
     accept_counts = {}
@@ -378,7 +374,7 @@ def scan_dir(root_dir):
             file_ext = file_ext.lower()
             if file_ext in config['accept_list']:
                 accept_counts[file_ext] += 1
-                get_metadata(root_dir, root, file)
+                get_metadata(db_h, root_dir, root, file)
             elif file_ext in config['reject_list']:
                 reject_counts[file_ext] += 1
             else:
@@ -406,7 +402,7 @@ def scan_dir(root_dir):
 
 
 def main():
-    global parm, conn, config
+    global parm, config, conn
     logging.info('Début du programme ' + sys.argv[0])
 
     # Get parameters and validate them
@@ -450,15 +446,15 @@ def main():
     logging.info(" ")
 
     conn = sqlite3.connect(db_path)
-    db_create_tables()        # Create the DB objects
-    db_remove_deleted()       # Remove deleted files from db
-    scan_dir(source_dir)      # Create inventory of the files in the source directory structure
-    list_dup(source_dir)
-    scan_dir(target_dir)      # Create inventory of the files in the target directory structure
-    file_copied = find_missing_files(source_dir, target_dir)  # Identify files that need to be copied
+    db_create_tables(conn)    # Create the DB objects
+    db_remove_deleted(conn)       # Remove deleted files from db
+    scan_dir(conn, source_dir)      # Create inventory of the files in the source directory structure
+    list_dup(conn, source_dir)
+    scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
+    file_copied = find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
     if file_copied > 0:
-        scan_dir(target_dir)  # Update inventory of the files in the target directory structure
-    list_dup(target_dir)
+        scan_dir(conn, target_dir)  # Update inventory of the files in the target directory structure
+    list_dup(conn, target_dir)
     conn.commit()
     conn.close()
 
