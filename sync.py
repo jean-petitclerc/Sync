@@ -6,14 +6,16 @@ import sqlite3
 import hashlib
 import logging
 import shutil
+import paramiko
 from optparse import OptionParser
 
 logging.basicConfig(level=logging.INFO, format=' %(asctime)s - %(levelname)s - %(message)s')
 
 # Global variable
 config = {}
+cred = {}
 conn = None  # DB handle
-
+ssh_client = None
 
 # Global constant
 CONFIG_FILE = 'data' + os.sep + 'sync.cfg'
@@ -40,6 +42,8 @@ def parse_options():
     parser = OptionParser(usage=usage)
     parser.add_option("-c", "--copy", dest="copy", action="store_true", default=False,
                       help="Copy the files to the target location, if needed.")
+    parser.add_option("-r", "--remote", dest="remote", action="store", default=False,
+                      help="The host file to connect to a target location that is on a remote server.")
     (options, args) = parser.parse_args()
     return options, args  # options: copy, rejects; args: source_dir target_dir
 
@@ -60,15 +64,52 @@ def parse_configs():
     return config
 
 
-def db_get_name(source_dir, target_dir):
+def parse_host_info(host_file):
+    global cred
+    try:
+        cfg_parser = configparser.ConfigParser()
+        cfg_parser.read(host_file)
+        cred['host'] = cfg_parser['host']['SERVER']
+        cred['user'] = cfg_parser['host']['USER']
+        cred['pswd'] = cfg_parser['host']['PASS']
+        port = cfg_parser['host']['PORT']
+        if not port.isdigit():
+            logging.error("The port number must be numeric.")
+            cred['valid'] = False
+        else:
+            cred['port'] = int(port)
+            cred['valid'] = True
+    except Exception as x:
+        logging.error("Could not read the configuration file: " + host_file)
+        logging.error(x)
+    return
+
+
+def check_target_dir_rmt(ssh, target_dir):
+    ssh_command = "ls " + target_dir
+    rc = ssh_command_with_rc(ssh, ssh_command)
+    if rc == 0:
+        return 0
+    logging.info("        Le dossier cible n'existe pas. Il sera créé...")
+    rc = ssh_command_with_rc(ssh, "mkdir -m 750 -p " + target_dir)
+    if rc > 0:
+        logging.info("The mkdir failed, RC: %i" % rc)
+    return rc
+
+
+def db_get_name(source_dir, target_dir, host):
     """
     Build a hash value from the concatenation of source_dir and target_dir
     :param source_dir:
     :param target_dir:
+    :param host: If the target directory is on a remote host use the server name
     :return: a hash value digest suffixed with .db
     """
     m = hashlib.md5()
-    temp = source_dir + target_dir
+    if host:
+        temp = source_dir + host + target_dir
+    else:
+        temp = source_dir + target_dir
     m.update(temp.encode('utf-8'))
     db_name = m.hexdigest() + ".db"
     return db_name
@@ -401,13 +442,33 @@ def scan_dir(db_h, root_dir):
     logging.debug("Sortie de scan_dir.")
 
 
+def connect_ssh():
+    ssh = None
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(cred[0], port=cred[1], username=cred[2], password=cred[3])
+    except Exception as x:
+        logging.error("SSH Error: \n" + str(x))
+    return ssh
+
+
+def ssh_command_with_rc(ssh, command):
+    channel = ssh.get_transport().open_session()
+    channel.exec_command(command)
+    rc = channel.recv_exit_status()
+    return rc
+
+
 def main():
-    global parm, config, conn
+    global parm, config, conn, cred, ssh_client
+
     logging.info('Début du programme ' + sys.argv[0])
 
     # Get parameters and validate them
     (options, args) = parse_options()
     parm["copy"] = options.copy
+    parm["remote"] = options.remote
     if len(args) < 2:
         logging.error("Ce programme a besoin de deux arguments, le dossier source et le dossier cible.")
         return 8
@@ -421,9 +482,21 @@ def main():
         return 8
 
     logging.info("    Dossier cible................................: %s" % target_dir)
-    if not os.path.isdir(target_dir):
-        logging.warning("    Le dossier cible n'existe pas. Il sera créé.")
-        os.makedirs(target_dir)
+    if parm["remote"] is not None:
+        parse_host_info(parm["remote"])
+        if not cred['valid']:
+            return 8
+        logging.info("    Le dossier cible est sur un serveur distant.")
+        logging.info("        Serveur..................................: %s" % cred['host'])
+        logging.info("        Port.....................................: %i" % cred['port'])
+        logging.info("        User.....................................: %s" % cred['user'])
+        ssh_client = connect_ssh()
+        if check_target_dir_rmt(ssh_client, target_dir) > 0:
+            return 8
+    else:
+        if not os.path.isdir(target_dir):
+            logging.warning("    Le dossier cible n'existe pas. Il sera créé.")
+            os.makedirs(target_dir)
 
     if parm["copy"]:
         logging.info("    Option de copie..............................: On")
@@ -440,14 +513,14 @@ def main():
     for ext in config['reject_list']:
         logging.info("    Rejected extension...........................: %s" % ext)
 
-    db_name = db_get_name(source_dir, target_dir)
+    db_name = db_get_name(source_dir, target_dir, cred[0])
     db_path = source_dir + os.sep + db_name
     logging.info("    Database file................................: " + db_name)
     logging.info(" ")
 
     conn = sqlite3.connect(db_path)
-    db_create_tables(conn)    # Create the DB objects
-    db_remove_deleted(conn)       # Remove deleted files from db
+    db_create_tables(conn)          # Create the DB objects
+    db_remove_deleted(conn)         # Remove deleted files from db
     scan_dir(conn, source_dir)      # Create inventory of the files in the source directory structure
     list_dup(conn, source_dir)
     scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
@@ -457,6 +530,8 @@ def main():
     list_dup(conn, target_dir)
     conn.commit()
     conn.close()
+    if ssh_client:
+        ssh_client.close()
 
     logging.info('Fin du programme ' + sys.argv[0])
     return 0
