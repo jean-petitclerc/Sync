@@ -7,9 +7,8 @@ import hashlib
 import logging
 import shutil
 import paramiko
+import json
 from optparse import OptionParser
-
-logging.basicConfig(level=logging.INFO, format=' %(asctime)s - %(levelname)s - %(message)s')
 
 # Global variable
 config = {}
@@ -35,6 +34,11 @@ class File(object):
         self.root_dir = root_dir
         self.rel_path = rel_path
         self.local_rmt = local_rmt
+
+    def __str__(self):
+        return "File:\nDir: " + self.dir_name + "\nFile: " + self.file_name + "\nMD5: " + self.file_md5 + \
+               "\nMTime: " + self.file_mtime + " Size: " + str(self.file_size) + " Local/Remote: " + self.local_rmt + \
+               "\nRoot dir: " + self.root_dir + "\nRelative Path: " + self.rel_path
 
 
 def parse_options():
@@ -199,9 +203,9 @@ def db_store_file(db_h, file):
         cur = db_h.cursor()
         cur.execute(select, [file.dir_name, file.file_name, file.local_rmt])
         row = cur.fetchone()
+        ins = db_h.cursor()
         if row is None:
             logging.debug("The file is NOT in the database.")
-            ins = db_h.cursor()
             ins.execute(insert, [file.dir_name, file.file_name, file.file_md5, file.file_mtime, file.file_size,
                                  file.root_dir, file.rel_path, file.local_rmt])
         else:
@@ -419,7 +423,7 @@ def get_metadata(db_h, root_dir, dir_name, file_name):
         # pipe contents of the file through
         file_md5 = hashlib.md5(data).hexdigest()
     rel_path = os.path.relpath(dir_name, root_dir)
-    logging.info("Fichiers: %s" % file_path)
+    logging.info("Fichier: %s" % file_path)
     logging.debug("    Date modification (formatté).................: %s" % file_mtime)
     logging.debug("    Grosseur en bytes............................: %i" % file_size)
     logging.debug("    Checksum.....................................: %s" % file_md5)
@@ -476,23 +480,44 @@ def scan_dir(db_h, root_dir):
 def scan_dir_rmt(db_h, ssh, root_dir):
     logging.debug("Entrée dans scan_dir_rmt. Parm: " + root_dir)
 
-    accept_list = config['accept_list'].join(',')
-    reject_list = config['reject_list'].join(',')
+    count_files = 0
+    accept_list = ",".join(config['accept_list'])
+    reject_list = ",".join(config['reject_list'])
     logging.debug("Accept list: " + accept_list)
     logging.debug("Reject list: " + reject_list)
 
     logging.info("Inspection de " + root_dir)
-    command = "/usr/local/bin/sync_rmt.py -s -d " + root_dir + " -a " + accept_list + " -r " + reject_list
+    command = "/home/jean/sync_rmt.py -s -d " + root_dir + " -a '" + accept_list + "' -r '" + reject_list + "'"
     stdin, stdout, stderr = ssh.exec_command(command)
-    files = stdout.readlines()
-    for line in files:
-        logging.info(line)
+    data = stdout.read().decode('utf-8')
+    files = json.loads(data)
+    for item in files:
+        # dir_name, file_name, file_md5, file_mtime, file_size, root_dir, rel_path, local_rmt
+        dir_name = item['dir']
+        file_name = item['name']
+        file_md5 = get_md5_rmt(ssh, dir_name, file_name)
+        file_mtime = item['mtime']
+        file_size = item['size']
+        # root_dir from parm
+        rel_path = item['rel_path']
+        local_rmt = 'R'
+        file = File(file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path, local_rmt)
+        logging.info("Fichier: " + cred['host'] + ":" + dir_name + "/" + file_name)
+        logging.debug(file)
+        db_store_file(db_h, file)
+        count_files += 1
     # Summary Report
     logging.info(" ")
-    logging.info("Statistiques pour " + root_dir)
-
+    logging.info("Statistiques pour " + root_dir + ": " + str(count_files) + " fichiers.")
     logging.info(" ")
     logging.debug("Sortie de scan_dir.")
+
+
+def get_md5_rmt(ssh, dir_name, file_name):
+    command = "/home/jean/sync_rmt.py -m -d '" + dir_name + "' -f '" + file_name + "'"
+    stdin, stdout, stderr = ssh.exec_command(command)
+    md5 = stdout.read().decode('utf-8')
+    return md5
 
 
 def connect_ssh():
@@ -588,6 +613,7 @@ def main():
     db_create_tables(conn)               # Create the DB objects
     db_remove_deleted(conn, ssh_client)  # Remove deleted files from db
     scan_dir(conn, source_dir)           # Create inventory of the files in the source directory structure
+    conn.commit()
 
     if parm["dup"] in 'ST':
         list_dup(conn, source_dir)
@@ -596,7 +622,9 @@ def main():
         scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
     else:
         scan_dir_rmt(conn, ssh_client, target_dir)
+    conn.commit()
 
+    return 8
     find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
 
     if parm["dup"] in 'CT':
@@ -612,4 +640,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format=' %(asctime)s - %(levelname)s - %(message)s')
     sys.exit(main())
