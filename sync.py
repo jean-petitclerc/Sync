@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format=' %(asctime)s - %(levelname)s - %
 
 # Global variable
 config = {}
-cred = {}
+cred = {'host': '', 'port': 22, 'user': '', 'pswd': ''}
 conn = None  # DB handle
 ssh_client = None
 
@@ -22,11 +22,11 @@ CONFIG_FILE = 'data' + os.sep + 'sync.cfg'
 
 
 # parms
-parm = {'copy': False, 'rejects': False, 'backup': False}
+parm = {'copy': False, 'remote': None, 'dup': 'N'}
 
 
 class File(object):
-    def __init__(self, file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path):
+    def __init__(self, file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path, local_rmt):
         self.file_name = file_name
         self.file_md5 = file_md5
         self.file_mtime = file_mtime
@@ -34,16 +34,19 @@ class File(object):
         self.dir_name = dir_name
         self.root_dir = root_dir
         self.rel_path = rel_path
+        self.local_rmt = local_rmt
 
 
 def parse_options():
     # Use optparse to get parms
     usage = "usage: %prog [options] source cible"
     parser = OptionParser(usage=usage)
-    parser.add_option("-c", "--copy", dest="copy", action="store_true", default=False,
-                      help="Copy the files to the target location, if needed.")
-    parser.add_option("-r", "--remote", dest="remote", action="store", default=False,
-                      help="The host file to connect to a target location that is on a remote server.")
+    parser.add_option("-c", "--copie", dest="copy", action="store_true", default=False,
+                      help="Copie les fichiers vers le r/pertoire cible.")
+    parser.add_option("-d", "--doublons", dest="dup", action="store", default='N',
+                      help="Liste les doublons sur la S(ource), C(ible) or T(ous).")
+    parser.add_option("-r", "--remote", dest="remote", action="store", default=None,
+                      help="Fichier pour les paramètres de connection pour les cibles distantes.")
     (options, args) = parser.parse_args()
     return options, args  # options: copy, rejects; args: source_dir target_dir
 
@@ -106,7 +109,7 @@ def db_get_name(source_dir, target_dir, host):
     :return: a hash value digest suffixed with .db
     """
     m = hashlib.md5()
-    if host:
+    if host is not None:
         temp = source_dir + host + target_dir
     else:
         temp = source_dir + target_dir
@@ -132,7 +135,8 @@ create table if not exists file (
   file_mtime timestamp not null,
   file_size  int       not null,
   root_dir   text      not null,
-  rel_path   text      not null
+  rel_path   text      not null,
+  local_rmt  text      not null
   )
 ;
         ''',
@@ -168,8 +172,8 @@ create index if not exists ix_file_03
 def db_store_file(db_h, file):
     insert = \
         '''
-        insert into file(dir_name, file_name, file_md5, file_mtime, file_size, root_dir, rel_path)
-            values(?, ?, ?, ?, ?, ?, ?)
+        insert into file(dir_name, file_name, file_md5, file_mtime, file_size, root_dir, rel_path, local_rmt)
+            values(?, ?, ?, ?, ?, ?, ?, ?)
         '''
     update = \
         '''
@@ -179,6 +183,7 @@ def db_store_file(db_h, file):
                file_size  = ?
          where dir_name   = ?
            and file_name  = ?
+           and local_rmt  = ?
         '''
 
     select = \
@@ -187,17 +192,18 @@ def db_store_file(db_h, file):
           from file
          where dir_name  = ?
            and file_name = ?
+           and local_rmt = ?
         '''
 
     try:
         cur = db_h.cursor()
-        cur.execute(select, [file.dir_name, file.file_name])
+        cur.execute(select, [file.dir_name, file.file_name, file.local_rmt])
         row = cur.fetchone()
         if row is None:
             logging.debug("The file is NOT in the database.")
             ins = db_h.cursor()
             ins.execute(insert, [file.dir_name, file.file_name, file.file_md5, file.file_mtime, file.file_size,
-                                 file.root_dir, file.rel_path])
+                                 file.root_dir, file.rel_path, file.local_rmt])
         else:
             logging.debug("The file is already in the database.")
             logging.debug("Comparing the md5/mtime/size.")
@@ -206,16 +212,18 @@ def db_store_file(db_h, file):
             else:
                 logging.debug("Updating file md5, mtime and size.")
                 upd = db_h.cursor()
-                upd.execute(update, [file.file_md5, file.file_mtime, file.file_size, file.dir_name, file.file_name])
+                upd.execute(update, [file.file_md5, file.file_mtime, file.file_size, file.dir_name, file.file_name,
+                                     file.local_rmt])
     except sqlite3.Error as x:
         logging.error("SQL Error: \n" + str(x))
 
 
-def db_remove_deleted(db_h):
+def db_remove_deleted(db_h, ssh):
     """
     Verifies that every file in the file table really exists on the filesystem.
     If not the entry is deleted from the table.
     :param db_h: DB handle
+    :param ssh: ssh client connect handle
     :return: Nothing
     """
 
@@ -225,7 +233,7 @@ def db_remove_deleted(db_h):
 
     select = \
         '''
-        select dir_name, file_name
+        select dir_name, file_name, local_rmt
           from file
          order by dir_name, file_name
         '''
@@ -235,6 +243,7 @@ def db_remove_deleted(db_h):
         delete from file
          where dir_name  = ?
            and file_name = ?
+           and local_rmt = ?
         '''
 
     try:
@@ -242,15 +251,28 @@ def db_remove_deleted(db_h):
         for row in cur.execute(select, []):
             dir_name = row[0]
             file_name = row[1]
+            local_rmt = row[2]
             file_path = dir_name + os.sep + file_name
-            if os.path.isfile(file_path):
-                count_found += 1
-                logging.debug("Fichier existant.....: " + file_path)
-            else:
-                count_notfound += 1
-                logging.debug("Fichier non-existant.: " + file_path)
-                dlt = db_h.cursor()
-                dlt.execute(delete, [dir_name, file_name])
+            if local_rmt == 'L':
+                if os.path.isfile(file_path):
+                    count_found += 1
+                    logging.debug("Fichier existant.....: " + file_path)
+                else:
+                    count_notfound += 1
+                    logging.debug("Fichier non-existant.: " + file_path)
+                    dlt = db_h.cursor()
+                    dlt.execute(delete, [dir_name, file_name, local_rmt])
+            else:   # local_rmt == 'R'
+                file_path = dir_name + '/' + file_name
+                rc = ssh_command_with_rc(ssh, "ls " + file_path)
+                if rc == 0:
+                    count_found += 1
+                    logging.debug("Fichier existant.....: " + file_path)
+                else:
+                    count_notfound += 1
+                    logging.debug("Fichier non-existant.: " + file_path)
+                    dlt = db_h.cursor()
+                    dlt.execute(delete, [dir_name, file_name, local_rmt])
     except sqlite3.Error as x:
         logging.error("SQL Error: \n" + str(x))
     logging.info("Nettoyage terminé")
@@ -301,7 +323,7 @@ def find_missing_files(db_h, source_dir, target_dir):
 
     sel_src = \
         '''
-        select dir_name, file_name, file_md5, file_mtime, rel_path
+        select dir_name, file_name, file_md5, file_size, file_mtime, rel_path
           from file
          where root_dir = ?
          order by dir_name, file_name
@@ -322,13 +344,21 @@ def find_missing_files(db_h, source_dir, target_dir):
             dir_name = row_src[0]
             file_name = row_src[1]
             file_md5_src = row_src[2]
-            file_mtime_src = row_src[3]
-            rel_path = row_src[4]
+            file_size_src = row_src[3]
+            file_mtime_src = row_src[4]
+            rel_path = row_src[5]
             cur_tgt.execute(sel_tgt, [target_dir, rel_path, file_name])
             row_tgt = cur_tgt.fetchone()
+            if rel_path == '.':
+                dir_name_tgt = target_dir
+            else:
+                dir_name_tgt = target_dir + os.sep + rel_path
+            new_file = File(file_name, file_md5_src, file_mtime_src, file_size_src, dir_name_tgt,
+                            target_dir, rel_path, "L")
             if row_tgt is None:
                 # Copy
                 copy_file(dir_name, file_name, target_dir, rel_path)
+                db_store_file(db_h, new_file)
                 counts['copy'] += 1
             else:
                 counts['compare'] += 1
@@ -342,6 +372,7 @@ def find_missing_files(db_h, source_dir, target_dir):
                     if file_mtime_src > file_mtime_tgt:
                         logging.debug("Le fichier est plus récent et doit être copié.")
                         copy_file(dir_name, file_name, target_dir, rel_path)
+                        db_store_file(db_h, new_file)
                         counts['newer'] += 1
                     else:
                         logging.debug("Le fichier sur la cible est plus récent. Il ne sera pas écrasé.")
@@ -392,7 +423,7 @@ def get_metadata(db_h, root_dir, dir_name, file_name):
     logging.debug("    Date modification (formatté).................: %s" % file_mtime)
     logging.debug("    Grosseur en bytes............................: %i" % file_size)
     logging.debug("    Checksum.....................................: %s" % file_md5)
-    file = File(file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path)
+    file = File(file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path, "L")
     db_store_file(db_h, file)
 
 
@@ -442,12 +473,34 @@ def scan_dir(db_h, root_dir):
     logging.debug("Sortie de scan_dir.")
 
 
+def scan_dir_rmt(db_h, ssh, root_dir):
+    logging.debug("Entrée dans scan_dir_rmt. Parm: " + root_dir)
+
+    accept_list = config['accept_list'].join(',')
+    reject_list = config['reject_list'].join(',')
+    logging.debug("Accept list: " + accept_list)
+    logging.debug("Reject list: " + reject_list)
+
+    logging.info("Inspection de " + root_dir)
+    command = "/usr/local/bin/sync_rmt.py -s -d " + root_dir + " -a " + accept_list + " -r " + reject_list
+    stdin, stdout, stderr = ssh.exec_command(command)
+    files = stdout.readlines()
+    for line in files:
+        logging.info(line)
+    # Summary Report
+    logging.info(" ")
+    logging.info("Statistiques pour " + root_dir)
+
+    logging.info(" ")
+    logging.debug("Sortie de scan_dir.")
+
+
 def connect_ssh():
     ssh = None
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(cred[0], port=cred[1], username=cred[2], password=cred[3])
+        ssh.connect(cred['host'], port=cred['port'], username=cred['user'], password=cred['pswd'])
     except Exception as x:
         logging.error("SSH Error: \n" + str(x))
     return ssh
@@ -469,6 +522,7 @@ def main():
     (options, args) = parse_options()
     parm["copy"] = options.copy
     parm["remote"] = options.remote
+    parm["dup"] = options.dup
     if len(args) < 2:
         logging.error("Ce programme a besoin de deux arguments, le dossier source et le dossier cible.")
         return 8
@@ -499,9 +553,21 @@ def main():
             os.makedirs(target_dir)
 
     if parm["copy"]:
-        logging.info("    Option de copie..............................: On")
+        logging.info("    Option de copie..............................: Oui")
     else:
-        logging.info("    Option de copie..............................: Off")
+        logging.info("    Option de copie..............................: Non")
+
+    parm["dup"] = parm["dup"].upper()
+    if parm["dup"] == 'S':
+        logging.info("    Option de vérification de doublons...........: Source")
+    elif parm["dup"] == 'C':
+        logging.info("    Option de vérification de doublons...........: Cible")
+    elif parm["dup"] == 'T':
+        logging.info("    Option de vérification de doublons...........: Tous")
+    elif parm["dup"] == 'N':
+        logging.info("    Option de vérification de doublons...........: Non")
+    else:
+        logging.info("    Option de vérification de doublons...........: Invalide")
     logging.info(" ")
 
     # Read config file
@@ -513,21 +579,29 @@ def main():
     for ext in config['reject_list']:
         logging.info("    Rejected extension...........................: %s" % ext)
 
-    db_name = db_get_name(source_dir, target_dir, cred[0])
+    db_name = db_get_name(source_dir, target_dir, cred['host'])
     db_path = source_dir + os.sep + db_name
     logging.info("    Database file................................: " + db_name)
     logging.info(" ")
 
     conn = sqlite3.connect(db_path)
-    db_create_tables(conn)          # Create the DB objects
-    db_remove_deleted(conn)         # Remove deleted files from db
-    scan_dir(conn, source_dir)      # Create inventory of the files in the source directory structure
-    list_dup(conn, source_dir)
-    scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
-    file_copied = find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
-    if file_copied > 0:
-        scan_dir(conn, target_dir)  # Update inventory of the files in the target directory structure
-    list_dup(conn, target_dir)
+    db_create_tables(conn)               # Create the DB objects
+    db_remove_deleted(conn, ssh_client)  # Remove deleted files from db
+    scan_dir(conn, source_dir)           # Create inventory of the files in the source directory structure
+
+    if parm["dup"] in 'ST':
+        list_dup(conn, source_dir)
+
+    if parm['remote'] is None:
+        scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
+    else:
+        scan_dir_rmt(conn, ssh_client, target_dir)
+
+    find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
+
+    if parm["dup"] in 'CT':
+        list_dup(conn, target_dir)
+
     conn.commit()
     conn.close()
     if ssh_client:
