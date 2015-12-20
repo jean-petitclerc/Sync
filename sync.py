@@ -322,7 +322,7 @@ def list_dup(db_h, root_dir):
         logging.error("SQL Error: \n" + str(x))
 
 
-def find_missing_files(db_h, source_dir, target_dir):
+def find_missing_files(db_h, ssh, source_dir, target_dir):
     counts = {'copy': 0, 'compare': 0, 'kept': 0, 'newer': 0, 'older': 0}
 
     sel_src = \
@@ -358,7 +358,7 @@ def find_missing_files(db_h, source_dir, target_dir):
             else:
                 dir_name_tgt = target_dir + os.sep + rel_path
             new_file = File(file_name, file_md5_src, file_mtime_src, file_size_src, dir_name_tgt,
-                            target_dir, rel_path, "L")
+                            target_dir, rel_path, "X")
             if row_tgt is None:
                 # Copy
                 copy_file(dir_name, file_name, target_dir, rel_path)
@@ -394,20 +394,35 @@ def find_missing_files(db_h, source_dir, target_dir):
     return counts['copy'] + counts['newer']
 
 
-def copy_file(dir_name, file_name, target_dir, rel_path):
+def copy_file(ssh, dir_name, file_name, target_dir, rel_path):
     source_path = dir_name + os.sep + file_name
-    if rel_path == '.':
-        tgt_dir = target_dir
-    else:
-        tgt_dir = target_dir + os.sep + rel_path
-    target_path = os.path.join(tgt_dir, file_name)
     logging.info("Copie de.........................................: %s" % source_path)
-    logging.info("    vers.........................................: %s" % target_path)
-    if parm["copy"]:
-        os.makedirs(tgt_dir, exist_ok=True)
-        shutil.copy2(source_path, target_path)
+    if parm['remote'] is None:
+        if rel_path == '.':
+            tgt_dir = target_dir
+        else:
+            tgt_dir = target_dir + os.sep + rel_path
+        target_path = os.path.join(tgt_dir, file_name)
+        logging.info("    vers.........................................: %s" % target_path)
+        if parm["copy"]:
+            os.makedirs(tgt_dir, exist_ok=True)
+            shutil.copy2(source_path, target_path)
+        else:
+            logging.info("Mode simulation: Fichier ne sera pas copié.")
     else:
-        logging.debug("Mode simulation: Fichier ne sera pas copié.")
+        if rel_path == '.':
+            tgt_dir = target_dir
+        else:
+            tgt_dir = target_dir + '/' + rel_path
+        target_path = tgt_dir + '/' + file_name
+        logging.info("    vers.........................................: %s:%s" % cred['host'], target_path)
+        if parm["copy"]:
+            rc = check_target_dir_rmt(ssh, tgt_dir)
+            if rc == 0:
+                # scp
+                logging.debug(str(rc))
+            else:
+                logging.error("Remote mkdir failed.")
 
 
 def get_metadata(db_h, root_dir, dir_name, file_name):
