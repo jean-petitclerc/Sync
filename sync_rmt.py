@@ -31,6 +31,8 @@ def parse_options():
                       help="The directory name.")
     parser.add_option("-f", "--file", dest="file_name", action="store", default=False,
                       help="The file name.")
+    parser.add_option("-o", "--ossep", dest="os_sep", action="store_true", default=False,
+                      help="Return the os.sep")
     (options, args) = parser.parse_args()
     return options, args  # options: scan, md5; args(None)
 
@@ -109,6 +111,7 @@ def main():
     (options, args) = parse_options()
     parm["scan"] = options.scan
     parm["md5"] = options.md5
+    parm["os_sep"] = options.os_sep
     if parm["scan"]:
         if not options.dir_name:
             logging.error("-d is required for the scan option")
@@ -130,6 +133,8 @@ def main():
         file_name = options.file_name
         md5 = get_md5(dir_name, file_name)
         print(md5)
+    elif parm["os_sep"]:
+        print(os.sep)
     else:
         logging.error("Invalid option")
 

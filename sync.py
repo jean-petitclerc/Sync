@@ -15,6 +15,7 @@ config = {}
 cred = {'host': '', 'port': 22, 'user': '', 'pswd': ''}
 conn = None  # DB handle
 ssh_client = None
+os_sep_rmt = '/'
 
 # Global constant
 CONFIG_FILE = 'data' + os.sep + 'sync.cfg'
@@ -136,6 +137,14 @@ def check_target_dir_rmt(ssh, target_dir):
     if rc > 0:
         print_log('I', 0, msg="The mkdir failed", val="RC=%i" % rc)
     return rc
+
+
+def get_os_sep_rmt(ssh):
+    command = "/home/jean/sync_rmt.py -o"
+    stdin, stdout, stderr = ssh.exec_command(command)
+    data = stdout.read().decode('utf-8')
+    os_sep = data[0:1]
+    return os_sep
 
 
 def db_get_name(source_dir, target_dir, host):
@@ -301,7 +310,7 @@ def db_remove_deleted(db_h, ssh):
                     dlt = db_h.cursor()
                     dlt.execute(delete, [dir_name, file_name, local_rmt])
             else:   # local_rmt == 'R'
-                file_path = dir_name + '/' + file_name
+                file_path = dir_name + os_sep_rmt + file_name
                 rc = ssh_command_with_rc(ssh, "ls " + file_path)
                 if rc == 0:
                     count_found += 1
@@ -448,8 +457,8 @@ def copy_file(ssh, dir_name, file_name, target_dir, rel_path):
         if rel_path == '.':
             tgt_dir = target_dir
         else:
-            tgt_dir = target_dir + '/' + rel_path
-        target_path = tgt_dir + '/' + file_name
+            tgt_dir = target_dir + os_sep_rmt + rel_path
+        target_path = tgt_dir + os_sep_rmt + file_name
         print_log('I', 1, "vers", val="%s:%s" % (cred['host'], target_path))
         if parm["copy"]:
             rc = check_target_dir_rmt(ssh, tgt_dir)
@@ -552,7 +561,7 @@ def scan_dir_rmt(db_h, ssh, root_dir):
         rel_path = item['rel_path']
         local_rmt = 'R'
         file = File(file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path, local_rmt)
-        print_log('I', 0, msg="Fichier: " + cred['host'] + ":" + dir_name + "/" + file_name)
+        print_log('I', 0, msg="Fichier: " + cred['host'] + ":" + dir_name + os_sep_rmt + file_name)
         print_log('D', 0, msg=str(file))
         db_store_file(db_h, file)
         count_files += 1
@@ -627,8 +636,11 @@ def main():
         print_log('I', 2, msg="Port", val=str(cred['port']))
         print_log('I', 2, msg="User", val=str(cred['user']))
         ssh_client = connect_ssh()
+        os_sep_rmt = get_os_sep_rmt(ssh_client)
+        print_log('I', 2, msg="Séparateur OS", val=os_sep_rmt)
         if check_target_dir_rmt(ssh_client, target_dir) > 0:
             return 8
+
     else:
         if not os.path.isdir(target_dir):
             print_log('W', 1, msg="Le dossier cible n'existe pas. Il sera créé.")
@@ -681,6 +693,7 @@ def main():
         scan_dir_rmt(conn, ssh_client, target_dir)
     conn.commit()
 
+    return 8
     find_missing_files(conn, ssh_client, source_dir, target_dir)  # Identify files that need to be copied
 
     if parm["dup"] in 'CT':
