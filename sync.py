@@ -15,6 +15,7 @@ config = {}
 cred = {'host': '', 'port': 22, 'user': '', 'pswd': ''}
 conn = None  # DB handle
 ssh_client = None
+ftp_client = None
 os_sep_rmt = '/'
 
 # Global constant
@@ -127,21 +128,21 @@ def print_log(lvl, indent, msg=None, val=None, dotted=True):
         logging.info("    " + message)
 
 
-def check_target_dir_rmt(ssh, target_dir):
-    ssh_command = "ls " + target_dir
-    rc = ssh_command_with_rc(ssh, ssh_command)
+def check_target_dir_rmt(target_dir):
+    ssh_command = "ls '" + target_dir + "'"
+    rc = ssh_command_with_rc(ssh_command)
     if rc == 0:
         return 0
-    print_log('I', 2, msg="Le dossier cible n'existe pas. Il sera créé...")
-    rc = ssh_command_with_rc(ssh, "mkdir -m 750 -p " + target_dir)
+    print_log('I', 2, msg="Le dossier cible n'existe pas. Il sera créé.")
+    rc = ssh_command_with_rc("mkdir -m 750 -p '" + target_dir + "'")
     if rc > 0:
         print_log('I', 0, msg="The mkdir failed", val="RC=%i" % rc)
     return rc
 
 
-def get_os_sep_rmt(ssh):
+def get_os_sep_rmt():
     command = "/home/jean/sync_rmt.py -o"
-    stdin, stdout, stderr = ssh.exec_command(command)
+    stdin, stdout, stderr = ssh_client.exec_command(command)
     data = stdout.read().decode('utf-8')
     os_sep = data[0:1]
     return os_sep
@@ -265,12 +266,11 @@ def db_store_file(db_h, file):
         print_log('E', 0, msg="SQL Error: ", val=str(x), dotted=False)
 
 
-def db_remove_deleted(db_h, ssh):
+def db_remove_deleted(db_h):
     """
     Verifies that every file in the file table really exists on the filesystem.
     If not the entry is deleted from the table.
     :param db_h: DB handle
-    :param ssh: ssh client connect handle
     :return: Nothing
     """
 
@@ -303,21 +303,23 @@ def db_remove_deleted(db_h, ssh):
             if local_rmt == 'L':
                 if os.path.isfile(file_path):
                     count_found += 1
-                    print_log('D', 0, msg="Fichier existant.....: ", val=file_path, dotted=False)
+                    print_log('D', 1, msg="Fichier existant.....: ", val=file_path, dotted=False)
                 else:
                     count_notfound += 1
-                    print_log('D', 0, msg="Fichier non-existant.: ", val=file_path, dotted=False)
+                    print_log('I', 1, msg="Fichier non-existant.: ", val=file_path, dotted=False)
                     dlt = db_h.cursor()
                     dlt.execute(delete, [dir_name, file_name, local_rmt])
             else:   # local_rmt == 'R'
+                if os.sep in dir_name:
+                    dir_name = dir_name.replace(os.sep, os_sep_rmt)
                 file_path = dir_name + os_sep_rmt + file_name
-                rc = ssh_command_with_rc(ssh, "ls " + file_path)
+                rc = ssh_command_with_rc("ls '" + file_path + "'")
                 if rc == 0:
                     count_found += 1
-                    print_log('D', 0, msg="Fichier existant.....: ", val=file_path, dotted=False)
+                    print_log('D', 1, msg="Fichier existant.....: ", val=file_path, dotted=False)
                 else:
                     count_notfound += 1
-                    print_log('D', 0, msg="Fichier non-existant.: ", val=file_path, dotted=False)
+                    print_log('I', 1, msg="Fichier non-existant.: ", val=file_path, dotted=False)
                     dlt = db_h.cursor()
                     dlt.execute(delete, [dir_name, file_name, local_rmt])
     except sqlite3.Error as x:
@@ -366,7 +368,7 @@ def list_dup(db_h, root_dir):
         print_log('E', 0, msg="SQL Error: ", val=str(x), dotted=False)
 
 
-def find_missing_files(db_h, ssh, source_dir, target_dir):
+def find_missing_files(db_h, source_dir, target_dir):
     counts = {'copy': 0, 'compare': 0, 'kept': 0, 'newer': 0, 'older': 0}
 
     sel_src = \
@@ -401,13 +403,18 @@ def find_missing_files(db_h, ssh, source_dir, target_dir):
                 dir_name_tgt = target_dir
             else:
                 dir_name_tgt = target_dir + os.sep + rel_path
+            if parm["remote"] is None:
+                local_rmt = 'L'
+            else:
+                local_rmt = 'R'
             new_file = File(file_name, file_md5_src, file_mtime_src, file_size_src, dir_name_tgt,
-                            target_dir, rel_path, "X")
+                            target_dir, rel_path, local_rmt)
             if row_tgt is None:
                 # Copy
-                copy_file(dir_name, file_name, target_dir, rel_path)
-                db_store_file(db_h, new_file)
-                counts['copy'] += 1
+                rc = copy_file(dir_name, file_name, target_dir, rel_path)
+                if rc == 0:
+                    db_store_file(db_h, new_file)
+                    counts['copy'] += 1
             else:
                 counts['compare'] += 1
                 file_md5_tgt = row_tgt[0]
@@ -419,9 +426,10 @@ def find_missing_files(db_h, ssh, source_dir, target_dir):
                 else:
                     if file_mtime_src > file_mtime_tgt:
                         print_log('D', 0, msg="Le fichier est plus récent et doit être copié.")
-                        copy_file(dir_name, file_name, target_dir, rel_path)
-                        db_store_file(db_h, new_file)
-                        counts['newer'] += 1
+                        rc = copy_file(dir_name, file_name, target_dir, rel_path)
+                        if rc == 0:
+                            db_store_file(db_h, new_file)
+                            counts['newer'] += 1
                     else:
                         print_log('D', 0, msg="Le fichier sur la cible est plus récent. Il ne sera pas écrasé.")
                         counts['older'] += 1
@@ -438,7 +446,14 @@ def find_missing_files(db_h, ssh, source_dir, target_dir):
     return counts['copy'] + counts['newer']
 
 
-def copy_file(ssh, dir_name, file_name, target_dir, rel_path):
+def copy_file(dir_name, file_name, target_dir, rel_path):
+    global ssh_client, ftp_client
+    rc = 0
+    print_log('D', 0, msg="Entrée dans copy_file")
+    print_log('D', 1, msg="Dir Name", val=dir_name)
+    print_log('D', 1, msg="File Name", val=file_name)
+    print_log('D', 1, msg="Target Dir", val=target_dir)
+    print_log('D', 1, msg="Relative path", val=rel_path)
     source_path = dir_name + os.sep + file_name
     print_log('I', 0, msg="Copie de", val=source_path)
     if parm['remote'] is None:
@@ -453,7 +468,10 @@ def copy_file(ssh, dir_name, file_name, target_dir, rel_path):
             shutil.copy2(source_path, target_path)
         else:
             print_log('I', 0, msg="Mode simulation: Fichier ne sera pas copié.")
+            rc = 1
     else:
+        if os.sep in rel_path:
+            rel_path = rel_path.replace(os.sep, os_sep_rmt)
         if rel_path == '.':
             tgt_dir = target_dir
         else:
@@ -461,12 +479,29 @@ def copy_file(ssh, dir_name, file_name, target_dir, rel_path):
         target_path = tgt_dir + os_sep_rmt + file_name
         print_log('I', 1, "vers", val="%s:%s" % (cred['host'], target_path))
         if parm["copy"]:
-            rc = check_target_dir_rmt(ssh, tgt_dir)
-            if rc == 0:
-                # TODO: Copy remote
-                print_log('D', 0, msg="mkdir successful: ", val=str(rc), dotted=False)
+            dir_rc = check_target_dir_rmt(tgt_dir)
+            if dir_rc == 0:
+                ftp_success = False
+                ftp_attempts = 1
+                while not ftp_success and ftp_attempts <= 3:
+                    try:
+                        ftp_client.put(source_path, target_path)
+                        ftp_success = True
+                    except Exception as x:
+                        print_log('E', 0, msg="SSH Error: ", val=str(x), dotted=False)
+                        disconnect_ssh()
+                        connect_ssh()
+                    ftp_attempts += 1
+                if ftp_attempts == 3:
+                    print_log('E', 1, "La copie a échoué 3 fois.")
+                    rc = 8
             else:
-                print_log('E', 0, msg="Remote mkdir failed", val="RC=%i" % rc)
+                print_log('E', 0, msg="Remote mkdir failed", val="RC=%i" % dir_rc)
+                rc = 4
+        else:
+            print_log('I', 0, msg="Mode simulation: Fichier ne sera pas copié.")
+            rc = 1
+    return rc
 
 
 def get_metadata(db_h, root_dir, dir_name, file_name):
@@ -536,7 +571,7 @@ def scan_dir(db_h, root_dir):
     print_log('D', 0, "Sortie de scan_dir.")
 
 
-def scan_dir_rmt(db_h, ssh, root_dir):
+def scan_dir_rmt(db_h, root_dir):
     print_log('D', 0, msg="Entrée dans scan_dir_rmt. Parm: ", val=root_dir, dotted=False)
 
     count_files = 0
@@ -547,14 +582,14 @@ def scan_dir_rmt(db_h, ssh, root_dir):
 
     print_log('I', 0, msg="Inspection de ", val=root_dir, dotted=False)
     command = "/home/jean/sync_rmt.py -s -d " + root_dir + " -a '" + accept_list + "' -r '" + reject_list + "'"
-    stdin, stdout, stderr = ssh.exec_command(command)
+    stdin, stdout, stderr = ssh_client.exec_command(command)
     data = stdout.read().decode('utf-8')
     files = json.loads(data)
     for item in files:
         # dir_name, file_name, file_md5, file_mtime, file_size, root_dir, rel_path, local_rmt
         dir_name = item['dir']
         file_name = item['name']
-        file_md5 = get_md5_rmt(ssh, dir_name, file_name)
+        file_md5 = get_md5_rmt(dir_name, file_name)
         file_mtime = item['mtime']
         file_size = item['size']
         # root_dir from parm
@@ -572,33 +607,44 @@ def scan_dir_rmt(db_h, ssh, root_dir):
     print_log('D', 0, "Sortie de scan_dir_rmt.")
 
 
-def get_md5_rmt(ssh, dir_name, file_name):
+def get_md5_rmt(dir_name, file_name):
     command = "/home/jean/sync_rmt.py -m -d '" + dir_name + "' -f '" + file_name + "'"
-    stdin, stdout, stderr = ssh.exec_command(command)
+    stdin, stdout, stderr = ssh_client.exec_command(command)
     md5 = stdout.read().decode('utf-8')
     return md5
 
 
 def connect_ssh():
-    ssh = None
+    global ssh_client, ftp_client
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(cred['host'], port=cred['port'], username=cred['user'], password=cred['pswd'])
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(cred['host'], port=cred['port'], username=cred['user'], password=cred['pswd'])
+        ftp_client = ssh_client.open_sftp()
     except Exception as x:
         print_log('E', 0, msg="SSH Error: ", val=str(x), dotted=False)
-    return ssh
+        ssh_client = None
+        ftp_client = None
+    return
 
 
-def ssh_command_with_rc(ssh, command):
-    channel = ssh.get_transport().open_session()
+def disconnect_ssh():
+    global ssh_client, ftp_client
+    if ftp_client is not None:
+        ftp_client.close()
+    if ssh_client is not None:
+        ssh_client.close()
+
+
+def ssh_command_with_rc(command):
+    channel = ssh_client.get_transport().open_session()
     channel.exec_command(command)
     rc = channel.recv_exit_status()
     return rc
 
 
 def main():
-    global parm, config, conn, cred, ssh_client
+    global parm, config, conn, cred, ssh_client, ftp_client, os_sep_rmt
 
     # Get parameters and validate them
     (options, args) = parse_options()
@@ -635,10 +681,10 @@ def main():
         print_log('I', 2, msg="Serveur", val=cred['host'])
         print_log('I', 2, msg="Port", val=str(cred['port']))
         print_log('I', 2, msg="User", val=str(cred['user']))
-        ssh_client = connect_ssh()
-        os_sep_rmt = get_os_sep_rmt(ssh_client)
+        connect_ssh()
+        os_sep_rmt = get_os_sep_rmt()
         print_log('I', 2, msg="Séparateur OS", val=os_sep_rmt)
-        if check_target_dir_rmt(ssh_client, target_dir) > 0:
+        if check_target_dir_rmt(target_dir) > 0:
             return 8
 
     else:
@@ -680,7 +726,7 @@ def main():
 
     conn = sqlite3.connect(db_path)
     db_create_tables(conn)               # Create the DB objects
-    db_remove_deleted(conn, ssh_client)  # Remove deleted files from db
+    db_remove_deleted(conn)  # Remove deleted files from db
     scan_dir(conn, source_dir)           # Create inventory of the files in the source directory structure
     conn.commit()
 
@@ -690,19 +736,18 @@ def main():
     if parm['remote'] is None:
         scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
     else:
-        scan_dir_rmt(conn, ssh_client, target_dir)
+        scan_dir_rmt(conn, target_dir)
     conn.commit()
 
-    return 8
-    find_missing_files(conn, ssh_client, source_dir, target_dir)  # Identify files that need to be copied
+    find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
 
     if parm["dup"] in 'CT':
         list_dup(conn, target_dir)
 
     conn.commit()
     conn.close()
-    if ssh_client:
-        ssh_client.close()
+
+    disconnect_ssh()
 
     print_log('I', 0, msg="Fin du programme", val=sys.argv[0], dotted=False)
     return 0
