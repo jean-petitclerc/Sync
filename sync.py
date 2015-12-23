@@ -24,7 +24,12 @@ INDENT_SZ = 4
 MSG_LGT = 60
 
 # parms
-parm = {'copy': False, 'remote': None, 'dup': 'N'}
+# --copie:   True, False
+# --dup:     S(ource), C(ible) or T(ous)
+# --remote:  Fichier de connection ou None
+# --mode:    (P)rogressif ou (S)tandard
+# --logging: DEBUG, INFO, WARNING, ERROR ou CRITICAL
+parm = {'copy': False, 'dup': 'N', 'remote': None, 'mode': 'S', 'log': 'INFO'}
 
 
 class File(object):
@@ -54,13 +59,17 @@ def parse_options():
                       help="Liste les doublons sur la S(ource), C(ible) or T(ous).")
     parser.add_option("-r", "--remote", dest="remote", action="store", default=None,
                       help="Fichier pour les paramètres de connection pour les cibles distantes.")
+    parser.add_option("-m", "--mode", dest="mode", action="store", default='S',
+                      help="Mode (P)rogressif(un fichier par un) ou (S)tandard(scan source et cible puis compare.")
     parser.add_option("-l", "--logging", dest="log", action="store", default='INFO',
-                      help="Niveau de logging, DEBUG, INFO, ERROR, CRITICAL,...")
+                      help="Niveau de logging, DEBUG, INFO, WARNING, ERROR, CRITICAL,...")
     (options, args) = parser.parse_args()
     if len(args) < 2:
         parser.error("Ce programme a besoin de deux arguments, le dossier source et le dossier cible.")
     if options.log.upper() not in ['INFO', 'DEBUG', 'WARNING', 'ERROR', 'CRITICAL']:
         parser.error("Option de logging invalide: %s" % options.log)
+    if options.mode.upper() not in ['P', 'S']:
+        parser.error("Le mode doit être P pour Progressif ou S pour Standard")
 
     return options, args  # options: copy, rejects; args: source_dir target_dir
 
@@ -403,7 +412,7 @@ def find_missing_files(db_h, source_dir, target_dir):
                 dir_name_tgt = target_dir
             else:
                 dir_name_tgt = target_dir + os.sep + rel_path
-            if parm["remote"] is None:
+            if parm['remote'] is None:
                 local_rmt = 'L'
             else:
                 local_rmt = 'R'
@@ -463,7 +472,7 @@ def copy_file(dir_name, file_name, target_dir, rel_path):
             tgt_dir = target_dir + os.sep + rel_path
         target_path = os.path.join(tgt_dir, file_name)
         print_log('I', 1, msg="vers", val=target_path)
-        if parm["copy"]:
+        if parm['copy']:
             os.makedirs(tgt_dir, exist_ok=True)
             shutil.copy2(source_path, target_path)
         else:
@@ -478,7 +487,7 @@ def copy_file(dir_name, file_name, target_dir, rel_path):
             tgt_dir = target_dir + os_sep_rmt + rel_path
         target_path = tgt_dir + os_sep_rmt + file_name
         print_log('I', 1, "vers", val="%s:%s" % (cred['host'], target_path))
-        if parm["copy"]:
+        if parm['copy']:
             dir_rc = check_target_dir_rmt(tgt_dir)
             if dir_rc == 0:
                 ftp_success = False
@@ -491,6 +500,7 @@ def copy_file(dir_name, file_name, target_dir, rel_path):
                         print_log('E', 0, msg="SSH Error: ", val=str(x), dotted=False)
                         disconnect_ssh()
                         connect_ssh()
+                    # TODO stat the file and compare with expected size, md5
                     ftp_attempts += 1
                 if ftp_attempts == 3:
                     print_log('E', 1, "La copie a échoué 3 fois.")
@@ -523,6 +533,37 @@ def get_metadata(db_h, root_dir, dir_name, file_name):
     print_log('D', 1, msg="Checksum", val=file_md5)
     file = File(file_name, file_md5, file_mtime, file_size, dir_name, root_dir, rel_path, "L")
     db_store_file(db_h, file)
+    return file
+
+
+def get_metadata_rmt(db_h, target_dir, rel_path, file_name):
+    if os.sep in rel_path:
+        rel_path = rel_path.replace(os.sep, os_sep_rmt)
+    if rel_path == '.':
+        tgt_dir = target_dir
+    else:
+        tgt_dir = target_dir + os_sep_rmt + rel_path
+    target_path = tgt_dir + os_sep_rmt + file_name
+    try:
+        sftp_stat = ftp_client.stat(target_path)
+        file_size = sftp_stat.st_size
+        mtime = sftp_stat.st_mtime
+        lastmod_date = time.localtime(mtime)
+        file_mtime = time.strftime("%Y-%m-%d-%H.%M.%S", lastmod_date)
+        file_md5 = get_md5_rmt(tgt_dir, file_name)
+        print_log('I', 0, msg="Fichier remote: ", val=target_path, dotted=False)
+        print_log('D', 1, msg="Remote Date modification (formatté)", val=file_mtime)
+        print_log('D', 1, msg="Remote Grosseur en bytes", val=str(file_size))
+        print_log('D', 1, msg="Remote Checksum", val=file_md5)
+        file = File(file_name, file_md5, file_mtime, file_size, tgt_dir, target_dir, rel_path, "R")
+        db_store_file(db_h, file)
+    except IOError as x:
+        print_log('I', 1, msg="Fichier non trouvé sur le serveur distant.")
+        file = File(file_name, 'no md5', '0001-01-01-00.00.00', -1, tgt_dir, target_dir, rel_path, "R")
+    except Exception as x:
+        print_log('E', 1, msg="SSH Error: ", val=str(x), dotted=False)
+        file = File(file_name, 'no md5', '0001-01-01-00.00.00', -1, tgt_dir, target_dir, rel_path, "R")
+    return file
 
 
 def scan_dir(db_h, root_dir):
@@ -607,10 +648,88 @@ def scan_dir_rmt(db_h, root_dir):
     print_log('D', 0, "Sortie de scan_dir_rmt.")
 
 
+def scan_prog(db_h, source_dir, target_dir):
+    print_log('D', 0, msg="Entrée dans scan_prog.")
+    print_log('D', 1, msg="Source: ", val=source_dir, dotted=False)
+    print_log('D', 1, msg="Cible:  ", val=target_dir, dotted=False)
+
+    # Initialize counters
+    accept_counts = {}
+    for ext in config['accept_list']:
+        accept_counts[ext] = 0
+    reject_counts = {}
+    for ext in config['reject_list']:
+        reject_counts[ext] = 0
+    others_counts = {}
+    counts = {'found': 0, 'not_found': 0, '<>size': 0, '<>md5': 0}
+
+    # Scan the directory structure
+    print_log('I', 0, msg="Inspection de ", val=source_dir, dotted=False)
+    for root, dirs, files in os.walk(source_dir):
+        for file in files:
+            filename, file_ext = os.path.splitext(file)
+            file_ext = file_ext.lower()
+            if file_ext in config['accept_list']:
+                accept_counts[file_ext] += 1
+                loc_file = get_metadata(db_h, source_dir, root, file)
+                rel_path = loc_file.rel_path
+                rmt_file = get_metadata_rmt(db_h, target_dir, rel_path, file)
+                print_log('D', 0, msg="Local and remote file size",
+                          val='%i/%i' % (loc_file.file_size, rmt_file.file_size))
+                print_log('D', 0, msg="Local and remote file md5",
+                          val='%s/%s' % (loc_file.file_md5, rmt_file.file_md5))
+                if rmt_file.file_size == -1:
+                    print_log('D', 0, msg="rmt file size == -1")
+                    copy_file(loc_file.dir_name, file, target_dir, rel_path)
+                    counts['not_found'] += 1
+                else:
+                    if rmt_file.file_size != loc_file.file_size:
+                        print_log('D', 0, msg="file size different")
+                        copy_file(loc_file.dir_name, file, target_dir, rel_path)
+                        counts['<>size'] += 1
+                    else:
+                        if rmt_file.file_md5 != loc_file.file_md5:
+                            print_log('D', 0, msg="file md5 different")
+                            copy_file(loc_file.dir_name, file, target_dir, rel_path)
+                            counts['<>md5'] += 1
+                        else:
+                            counts['found'] += 1
+                print_log('I', 0)
+            elif file_ext in config['reject_list']:
+                reject_counts[file_ext] += 1
+            else:
+                if file_ext in others_counts:
+                    others_counts[file_ext] += 1
+                else:
+                    others_counts[file_ext] = 1
+                    print_log('I', 0, msg="Fichiers de type inconnu: ", val=os.path.join(root, file), dotted=False)
+
+    # Summary Report
+    print_log('I', 0)
+    print_log('I', 0, msg="Statistiques pour ", val=source_dir, dotted=False)
+    print_log('I', 1, msg="Comptes par type de fichiers acceptés:")
+    for ext in config['accept_list']:
+        print_log('I', 2, msg=ext, val=str(accept_counts[ext]))
+    print_log('I', 1, msg="Comptes par type de fichiers rejetés:")
+    for ext in config['reject_list']:
+        print_log('I', 2, msg=ext, val=str(reject_counts[ext]))
+    if len(others_counts) > 0:
+        print_log('I', 1, msg="Comptes par type de fichiers inattendus:")
+        for ext in others_counts:
+            print_log('I', 2, msg=ext, val=str(others_counts[ext]))
+    print_log('I', 0)
+    print_log('I', 1, msg="Copies évitées", val=str(counts['found']))
+    print_log('I', 1, msg="Fichiers non trouvés sur la cible copiés", val=str(counts['not_found']))
+    print_log('I', 1, msg="Fichiers de grandeurs différentes copiés", val=str(counts['<>size']))
+    print_log('I', 1, msg="Fichiers avec des MD5 différents copiés", val=str(counts['<>md5']))
+    print_log('I', 0)
+    print_log('D', 0, "Sortie de scan_dir.")
+
+
 def get_md5_rmt(dir_name, file_name):
     command = "/home/jean/sync_rmt.py -m -d '" + dir_name + "' -f '" + file_name + "'"
     stdin, stdout, stderr = ssh_client.exec_command(command)
-    md5 = stdout.read().decode('utf-8')
+    md5 = stdout.read().decode('utf-8').rstrip('\n')
     return md5
 
 
@@ -648,19 +767,20 @@ def main():
 
     # Get parameters and validate them
     (options, args) = parse_options()
-    parm["log"] = options.log
-    parm["copy"] = options.copy
-    parm["remote"] = options.remote
-    parm["dup"] = options.dup
+    parm['log'] = options.log.upper()
+    parm['copy'] = options.copy
+    parm['remote'] = options.remote
+    parm['dup'] = options.dup.upper()
+    parm['mode'] = options.mode.upper()
     source_dir = args[0]
     target_dir = args[1]
-    if parm['log'].upper() == 'CRITICAL':
+    if parm['log'] == 'CRITICAL':
         logging.basicConfig(level=logging.CRITICAL, format=' %(asctime)s - %(levelname)s - %(message)s')
-    elif parm['log'].upper() == 'ERROR':
+    elif parm['log'] == 'ERROR':
         logging.basicConfig(level=logging.ERROR, format=' %(asctime)s - %(levelname)s - %(message)s')
-    elif parm['log'].upper() == 'WARNING':
+    elif parm['log'] == 'WARNING':
         logging.basicConfig(level=logging.WARNING, format=' %(asctime)s - %(levelname)s - %(message)s')
-    elif parm['log'].upper() == 'DEBUG':
+    elif parm['log'] == 'DEBUG':
         logging.basicConfig(level=logging.DEBUG, format=' %(asctime)s - %(levelname)s - %(message)s')
     else:
         logging.basicConfig(level=logging.INFO, format=' %(asctime)s - %(levelname)s - %(message)s')
@@ -673,8 +793,8 @@ def main():
         return 8
 
     print_log('I', 1, msg="Dossier cible", val=target_dir)
-    if parm["remote"] is not None:
-        parse_host_info(parm["remote"])
+    if parm['remote'] is not None:
+        parse_host_info(parm['remote'])
         if not cred['valid']:
             return 8
         print_log('I', 1, msg="Le dossier cible est sur un serveur distant.")
@@ -686,25 +806,23 @@ def main():
         print_log('I', 2, msg="Séparateur OS", val=os_sep_rmt)
         if check_target_dir_rmt(target_dir) > 0:
             return 8
-
     else:
         if not os.path.isdir(target_dir):
             print_log('W', 1, msg="Le dossier cible n'existe pas. Il sera créé.")
             os.makedirs(target_dir)
 
-    if parm["copy"]:
+    if parm['copy']:
         print_log('I', 1, msg="Option de copie", val="Oui")
     else:
         print_log('I', 1, msg="Option de copie", val="Non")
 
-    parm["dup"] = parm["dup"].upper()
-    if parm["dup"] == 'S':
+    if parm['dup'] == 'S':
         print_log('I', 1, msg="Option de vérification de doublons", val="Source")
-    elif parm["dup"] == 'C':
+    elif parm['dup'] == 'C':
         print_log('I', 1, msg="Option de vérification de doublons", val="Cible")
-    elif parm["dup"] == 'T':
+    elif parm['dup'] == 'T':
         print_log('I', 1, msg="Option de vérification de doublons", val="Tous")
-    elif parm["dup"] == 'N':
+    elif parm['dup'] == 'N':
         print_log('I', 1, msg="Option de vérification de doublons", val="Non")
     else:
         print_log('I', 1, msg="Option de vérification de doublons", val="Invalide")
@@ -727,21 +845,21 @@ def main():
     conn = sqlite3.connect(db_path)
     db_create_tables(conn)               # Create the DB objects
     db_remove_deleted(conn)  # Remove deleted files from db
-    scan_dir(conn, source_dir)           # Create inventory of the files in the source directory structure
-    conn.commit()
-
-    if parm["dup"] in 'ST':
-        list_dup(conn, source_dir)
-
-    if parm['remote'] is None:
-        scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
-    else:
-        scan_dir_rmt(conn, target_dir)
-    conn.commit()
-
-    find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
-
-    if parm["dup"] in 'CT':
+    if parm['mode'] == 'S':
+        scan_dir(conn, source_dir)           # Create inventory of the files in the source directory structure
+        conn.commit()
+        if parm['dup'] in 'ST':
+            list_dup(conn, source_dir)
+        if parm['remote'] is None:
+            scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
+        else:
+            scan_dir_rmt(conn, target_dir)
+        conn.commit()
+        find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
+    else:  # Mode progressif
+        scan_prog(conn, source_dir, target_dir)
+        conn.commit()
+    if parm['dup'] in 'CT':
         list_dup(conn, target_dir)
 
     conn.commit()
