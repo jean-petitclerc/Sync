@@ -138,12 +138,12 @@ def print_log(lvl, indent, msg=None, val=None, dotted=True):
 
 
 def check_target_dir_rmt(target_dir):
-    ssh_command = "ls '" + target_dir + "'"
+    ssh_command = 'ls "' + target_dir.replace('"', '\\"') + '"'
     rc = ssh_command_with_rc(ssh_command)
     if rc == 0:
         return 0
     print_log('I', 2, msg="Le dossier cible n'existe pas. Il sera créé.")
-    rc = ssh_command_with_rc("mkdir -m 750 -p '" + target_dir + "'")
+    rc = ssh_command_with_rc('mkdir -m 750 -p "' + target_dir.replace('"', '\\"') + '"')
     if rc > 0:
         print_log('I', 0, msg="The mkdir failed", val="RC=%i" % rc)
     return rc
@@ -322,7 +322,7 @@ def db_remove_deleted(db_h):
                 if os.sep in dir_name:
                     dir_name = dir_name.replace(os.sep, os_sep_rmt)
                 file_path = dir_name + os_sep_rmt + file_name
-                rc = ssh_command_with_rc("ls '" + file_path + "'")
+                rc = ssh_command_with_rc('ls "' + file_path.replace('"', '\\"') + '"')
                 if rc == 0:
                     count_found += 1
                     print_log('D', 1, msg="Fichier existant.....: ", val=file_path, dotted=False)
@@ -485,7 +485,7 @@ def copy_file(dir_name, file_name, target_dir, rel_path):
             tgt_dir = target_dir
         else:
             tgt_dir = target_dir + os_sep_rmt + rel_path
-        target_path = tgt_dir + os_sep_rmt + file_name
+        target_path = tgt_dir + os_sep_rmt + file_name.replace("'", "\'")
         print_log('I', 1, "vers", val="%s:%s" % (cred['host'], target_path))
         if parm['copy']:
             dir_rc = check_target_dir_rmt(tgt_dir)
@@ -622,7 +622,8 @@ def scan_dir_rmt(db_h, root_dir):
     print_log('D', 0, msg="Reject list: ", val=reject_list, dotted=False)
 
     print_log('I', 0, msg="Inspection de ", val=root_dir, dotted=False)
-    command = "/home/jean/sync_rmt.py -s -d " + root_dir + " -a '" + accept_list + "' -r '" + reject_list + "'"
+    command = '/home/jean/sync_rmt.py -s -d "' + root_dir.replace('"', '\\"') + '" -a "' + \
+              accept_list + '" -r "' + reject_list + '"'
     stdin, stdout, stderr = ssh_client.exec_command(command)
     data = stdout.read().decode('utf-8')
     files = json.loads(data)
@@ -727,7 +728,8 @@ def scan_prog(db_h, source_dir, target_dir):
 
 
 def get_md5_rmt(dir_name, file_name):
-    command = "/home/jean/sync_rmt.py -m -d '" + dir_name + "' -f '" + file_name + "'"
+    command = '/home/jean/sync_rmt.py -m -d "' + dir_name.replace('"', '\\"') + \
+              '" -f "' + file_name.replace('"', '\\"') + '"'
     stdin, stdout, stderr = ssh_client.exec_command(command)
     md5 = stdout.read().decode('utf-8').rstrip('\n')
     return md5
