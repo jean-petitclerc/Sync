@@ -63,6 +63,8 @@ def parse_options():
                       help="Mode (P)rogressif(un fichier par un) ou (S)tandard(scan source et cible puis compare.")
     parser.add_option("-l", "--logging", dest="log", action="store", default='INFO',
                       help="Niveau de logging, DEBUG, INFO, WARNING, ERROR, CRITICAL,...")
+    parser.add_option("-t", "--scan-target", dest="scan_target", action="store_true", default=False,
+                      help="La destination est inspectée. Par défaut elle ne l'est pas.")
     (options, args) = parser.parse_args()
     if len(args) < 2:
         parser.error("Ce programme a besoin de deux arguments, le dossier source et le dossier cible.")
@@ -774,6 +776,7 @@ def main():
     parm['remote'] = options.remote
     parm['dup'] = options.dup.upper()
     parm['mode'] = options.mode.upper()
+    parm['scan_target'] = options.scan_target
     source_dir = args[0]
     target_dir = args[1]
     if parm['log'] == 'CRITICAL':
@@ -818,6 +821,11 @@ def main():
     else:
         print_log('I', 1, msg="Option de copie", val="Non")
 
+    if parm['scan_target']:
+        print_log('I', 1, msg="Inspection de la destination", val="Oui")
+    else:
+        print_log('I', 1, msg="Inspection de la destination", val="Non")
+
     if parm['dup'] == 'S':
         print_log('I', 1, msg="Option de vérification de doublons", val="Source")
     elif parm['dup'] == 'C':
@@ -852,11 +860,15 @@ def main():
         conn.commit()
         if parm['dup'] in 'ST':
             list_dup(conn, source_dir)
-        if parm['remote'] is None:
-            scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
+        if parm['scan_target']:
+            if parm['remote'] is None:
+                scan_dir(conn, target_dir)      # Create inventory of the files in the target directory structure
+            else:
+                scan_dir_rmt(conn, target_dir)
+            conn.commit()
         else:
-            scan_dir_rmt(conn, target_dir)
-        conn.commit()
+            print_log('I', 0, msg="Le destination ne sera pas inspectée. Seule la BD est consultée."
+                                  "")
         find_missing_files(conn, source_dir, target_dir)  # Identify files that need to be copied
     else:  # Mode progressif
         scan_prog(conn, source_dir, target_dir)
